@@ -4,15 +4,17 @@ Consolidate data into the database.
 
 import logging
 import os
-from typing import Dict, List, Literal
+from typing import List, Literal
 from zipfile import ZipFile
 
 import duckdb
 import requests
 
 from ._common import CACHE_FOLDER, DUCKDB_FILE, clear_cache
+from ._config_edc import create_edc_yearly_filename, get_edc_config
 
 logger = logging.getLogger(__name__)
+edc_config = get_edc_config()
 
 
 def check_table_existence(conn: duckdb.DuckDBPyConnection, table_name: str) -> bool:
@@ -31,31 +33,6 @@ def check_table_existence(conn: duckdb.DuckDBPyConnection, table_name: str) -> b
     return list(conn.fetchone())[0] == 1
 
 
-def get_yearly_edc_infos(year: str) -> Dict[str, str]:
-    """
-    Returns information for yearly dataset extract of the EDC (Eau distribuée par commune) datasets.
-    The data comes from https://www.data.gouv.fr/fr/datasets/resultats-du-controle-sanitaire-de-leau-distribuee-commune-par-commune/
-    For each year a dataset is downloadable on a URL like this (ex. 2024):
-        https://www.data.gouv.fr/fr/datasets/r/84a67a3b-08a7-4001-98e6-231c74a98139
-    The id of the dataset is the last part of this URL
-    The name of the dataset is dis-YEAR.zip (but the format could potentially change).
-    :param year: The year from which we want to get the dataset information.
-    :return: A dict with the id and name of the dataset.
-    """
-    edc_dis_files_info_by_year = {
-        "2024": {"id": "84a67a3b-08a7-4001-98e6-231c74a98139", "name": "dis-2024.zip"},
-        "2023": {"id": "c89dec4a-d985-447c-a102-75ba814c398e", "name": "dis-2023.zip"},
-        "2022": {"id": "a97b6074-c4dd-4ef2-8922-b0cf04dbff9a", "name": "dis-2022.zip"},
-        "2021": {"id": "d2b432cc-3761-44d3-8e66-48bc15300bb5", "name": "dis-2021.zip"},
-        "2020": {"id": "a6cb4fea-ef8c-47a5-acb3-14e49ccad801", "name": "dis-2020.zip"},
-        "2019": {"id": "861f2a7d-024c-4bf0-968b-9e3069d9de07", "name": "dis-2019.zip"},
-        "2018": {"id": "0513b3c0-dc18-468d-a969-b3508f079792", "name": "dis-2018.zip"},
-        "2017": {"id": "5785427b-3167-49fa-a581-aef835f0fb04", "name": "dis-2017.zip"},
-        "2016": {"id": "483c84dd-7912-483b-b96f-4fa5e1d8651f", "name": "dis-2016.zip"},
-    }
-    return edc_dis_files_info_by_year[year]
-
-
 def download_extract_insert_yearly_edc_data(year: str):
     """
     Downloads from www.data.gouv.fr the EDC (Eau distribuée par commune) dataset for one year,
@@ -65,30 +42,16 @@ def download_extract_insert_yearly_edc_data(year: str):
         It adds the column "de_partition" based on year as an integer.
     """
 
-    yearly_dataset_info = get_yearly_edc_infos(year=year)
-
     # Dataset specific constants
-    DATA_URL = f"https://www.data.gouv.fr/fr/datasets/r/{yearly_dataset_info['id']}"
-    ZIP_FILE = os.path.join(CACHE_FOLDER, yearly_dataset_info["name"])
+    DATA_URL = (
+        edc_config["source"]["base_url"]
+        + edc_config["source"]["yearly_files_infos"][year]["id"]
+    )
+    ZIP_FILE = os.path.join(
+        CACHE_FOLDER, edc_config["source"]["yearly_files_infos"][year]["zipfile"]
+    )
     EXTRACT_FOLDER = os.path.join(CACHE_FOLDER, f"raw_data_{year}")
-
-    FILES = {
-        "communes": {
-            "filename_prefix": f"DIS_COM_UDI_",
-            "file_extension": ".txt",
-            "table_name": f"edc_communes",
-        },
-        "prelevements": {
-            "filename_prefix": f"DIS_PLV_",
-            "file_extension": ".txt",
-            "table_name": f"edc_prelevements",
-        },
-        "resultats": {
-            "filename_prefix": f"DIS_RESULT_",
-            "file_extension": ".txt",
-            "table_name": f"edc_resultats",
-        },
-    }
+    FILES = edc_config["files"]
 
     logger.info(f"Processing EDC dataset for {year}...")
     response = requests.get(DATA_URL, stream=True)
@@ -106,7 +69,11 @@ def download_extract_insert_yearly_edc_data(year: str):
     for file_info in FILES.values():
         filepath = os.path.join(
             EXTRACT_FOLDER,
-            f"{file_info['filename_prefix']}{year}{file_info['file_extension']}",
+            create_edc_yearly_filename(
+                file_name_prefix=file_info["file_name_prefix"],
+                file_extension=file_info["file_extension"],
+                year=year,
+            ),
         )
 
         if check_table_existence(conn=conn, table_name=f"{file_info['table_name']}"):
@@ -124,7 +91,8 @@ def download_extract_insert_yearly_edc_data(year: str):
         query_select = f"""
             SELECT 
                 *,
-                CAST({year} as INTEGER) AS de_partition
+                CAST({year} AS INTEGER) AS de_partition,
+                current_date            AS de_ingestion_date
             FROM read_csv('{filepath}', header=true, delim=',');
         """
 
@@ -138,9 +106,25 @@ def download_extract_insert_yearly_edc_data(year: str):
     return True
 
 
+def get_all_tables(conn: duckdb.DuckDBPyConnection) -> List[str]:
+    """
+    Get all existing tables in the database
+    :param conn: The duckdb connection to use
+    :return: List of table names
+    """
+    query = """
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'main'
+    """
+    conn.execute(query)
+    return [row[0] for row in conn.fetchall()]
+
+
 def process_edc_datasets(
-    refresh_type: Literal["all", "last", "custom"] = "all",
+    refresh_type: Literal["all", "last", "custom"] = "last",
     custom_years: List[str] = None,
+    drop_tables: bool = False,
 ):
     """
     Process the EDC datasets.
@@ -149,19 +133,10 @@ def process_edc_datasets(
         - "last": Refresh the data only for the last available year
         - "custom": Refresh the data for the years specified in the list custom_years
     :param custom_years: years to update
+    :param drop_tables: whether to drop existing tables before processing
     :return:
     """
-    available_years = [
-        "2016",
-        "2017",
-        "2018",
-        "2019",
-        "2020",
-        "2021",
-        "2022",
-        "2023",
-        "2024",
-    ]
+    available_years = edc_config["source"]["available_years"]
 
     if refresh_type == "all":
         years_to_update = available_years
@@ -169,25 +144,30 @@ def process_edc_datasets(
         years_to_update = available_years[-1:]
     elif refresh_type == "custom":
         if custom_years:
-            # Check if every year provided are available
-            invalid_years = set(custom_years) - set(available_years)
-            if invalid_years:
-                raise ValueError(
-                    f"Invalid years provided: {sorted(invalid_years)}. Years must be among: {available_years}"
-                )
-            # Filtering and sorting of valid years
-            years_to_update = sorted(list(set(custom_years).intersection(available_years)))
+            years_to_update = list(set(custom_years).intersection(available_years))
         else:
             raise ValueError(
                 """ custom_years parameter needs to be specified if refresh_type="custom" """
             )
-
     else:
         raise ValueError(
             f""" refresh_type needs to be one of ["all", "last", "custom"], it can't be: {refresh_type}"""
         )
 
     logger.info(f"Launching processing of EDC datasets for years: {years_to_update}")
+
+    # Drop tables if requested
+    if drop_tables:
+        logger.info("Dropping existing tables...")
+        conn = duckdb.connect(DUCKDB_FILE)
+        # Récupération automatique des tables existantes
+        existing_tables = get_all_tables(conn)
+        # Ne supprimer que les tables EDC
+        edc_tables = [table for table in existing_tables if table.startswith("edc_")]
+        for table in edc_tables:
+            logger.info(f"   Dropping table {table}")
+            conn.execute(f"DROP TABLE {table};")
+        conn.close()
 
     for year in years_to_update:
         download_extract_insert_yearly_edc_data(year=year)
@@ -197,11 +177,5 @@ def process_edc_datasets(
     return True
 
 
-def execute(refresh_type: str = "all", custom_years: List[str] = None):
-    """
-    Execute the EDC dataset processing with specified parameters.
-    
-    :param refresh_type: Type of refresh to perform ("all", "last", or "custom")
-    :param custom_years: List of years to process when refresh_type is "custom"
-    """
-    process_edc_datasets(refresh_type=refresh_type, custom_years=custom_years)
+def execute():
+    process_edc_datasets()
