@@ -9,6 +9,7 @@ from zipfile import ZipFile
 
 import duckdb
 import requests
+from tqdm import tqdm
 
 from ._common import CACHE_FOLDER, DUCKDB_FILE, clear_cache
 
@@ -64,7 +65,6 @@ def download_extract_insert_yearly_edc_data(year: str):
     :return: Create or replace the associated tables in the duckcb database.
         It adds the column "de_partition" based on year as an integer.
     """
-
     yearly_dataset_info = get_yearly_edc_infos(year=year)
 
     # Dataset specific constants
@@ -74,27 +74,39 @@ def download_extract_insert_yearly_edc_data(year: str):
 
     FILES = {
         "communes": {
-            "filename_prefix": f"DIS_COM_UDI_",
+            "filename_prefix": "DIS_COM_UDI_",
             "file_extension": ".txt",
-            "table_name": f"edc_communes",
+            "table_name": "edc_communes",
         },
         "prelevements": {
-            "filename_prefix": f"DIS_PLV_",
+            "filename_prefix": "DIS_PLV_",
             "file_extension": ".txt",
-            "table_name": f"edc_prelevements",
+            "table_name": "edc_prelevements",
         },
         "resultats": {
-            "filename_prefix": f"DIS_RESULT_",
+            "filename_prefix": "DIS_RESULT_",
             "file_extension": ".txt",
-            "table_name": f"edc_resultats",
+            "table_name": "edc_resultats",
         },
     }
 
     logger.info(f"Processing EDC dataset for {year}...")
     response = requests.get(DATA_URL, stream=True)
-    with open(ZIP_FILE, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+    total_size = int(response.headers.get("content-length", 0))
+
+    with (
+        open(ZIP_FILE, "wb") as f,
+        tqdm(
+            desc=f"   Downloading {year}",
+            total=total_size,
+            unit="iB",
+            unit_scale=True,
+            unit_divisor=1024,
+        ) as pbar,
+    ):
+        for data in response.iter_content(chunk_size=1024):
+            size = f.write(data)
+            pbar.update(size)
 
     logger.info("   Extracting files...")
     with ZipFile(ZIP_FILE, "r") as zip_ref:
@@ -103,7 +115,8 @@ def download_extract_insert_yearly_edc_data(year: str):
     logger.info("   Creating or updating tables in the database...")
     conn = duckdb.connect(DUCKDB_FILE)
 
-    for file_info in FILES.values():
+    # Add progress bar for file processing
+    for file_info in tqdm(FILES.values(), desc="   Processing tables"):
         filepath = os.path.join(
             EXTRACT_FOLDER,
             f"{file_info['filename_prefix']}{year}{file_info['file_extension']}",
@@ -117,7 +130,6 @@ def download_extract_insert_yearly_edc_data(year: str):
             """
             conn.execute(query)
             query_start = f"INSERT INTO {f'{file_info["table_name"]}'} "
-
         else:
             query_start = f"CREATE TABLE {f'{file_info["table_name"]}'} AS "
 
@@ -176,7 +188,9 @@ def process_edc_datasets(
                     f"Invalid years provided: {sorted(invalid_years)}. Years must be among: {available_years}"
                 )
             # Filtering and sorting of valid years
-            years_to_update = sorted(list(set(custom_years).intersection(available_years)))
+            years_to_update = sorted(
+                list(set(custom_years).intersection(available_years))
+            )
         else:
             raise ValueError(
                 """ custom_years parameter needs to be specified if refresh_type="custom" """
@@ -189,7 +203,8 @@ def process_edc_datasets(
 
     logger.info(f"Launching processing of EDC datasets for years: {years_to_update}")
 
-    for year in years_to_update:
+    # Barre de progression pour les années
+    for year in tqdm(years_to_update, desc="Processing years"):
         download_extract_insert_yearly_edc_data(year=year)
 
     logger.info("Cleaning up cache...")
@@ -200,7 +215,7 @@ def process_edc_datasets(
 def execute(refresh_type: str = "all", custom_years: List[str] = None):
     """
     Execute the EDC dataset processing with specified parameters.
-    
+
     :param refresh_type: Type of refresh to perform ("all", "last", or "custom")
     :param custom_years: List of years to process when refresh_type is "custom"
     """
